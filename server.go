@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"strconv"
+	"bytes"
 	"os"
 	"fmt"
 	"time"
@@ -64,8 +65,8 @@ type Op struct {
 }
 
 type CacheEntry struct {
-	seq int
-	reply *GetReply
+	Seq int
+	Reply *GetReply
 }
 
 type RetInfo struct {
@@ -96,8 +97,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	DPrintfToFile(kv.me, "server:%d lock %d \n", kv.me, 6)
 	if cache, ok := kv.cacheMap[args.ClientId]; ok {
-		if cache.seq == args.ClientSeq {
-			*reply = *cache.reply
+		if cache.Seq == args.ClientSeq {
+			*reply = *cache.Reply
 			DPrintfToFile(kv.me, "server:%d unlock %d \n", kv.me, 6)
 			kv.mu.Unlock()
 			return
@@ -129,7 +130,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	DPrintfToFile(kv.me, "server:%d unlock %d \n", kv.me, 5)
 	kv.mu.Unlock()
 
-	stateOp := <- kv.retMap[index].retCh
+	stateOp := <- ret.retCh
 	DPrintfToFile(kv.me, "server:%d Get done waiting for retMap[%d] \n", kv.me, index)
 
 	DPrintfToFile(kv.me, "server:%d attempt lock %d \n", kv.me, 4)
@@ -139,7 +140,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if stateOp == EXEC {
 		*reply = *kv.retMap[index].reply
 	} else if stateOp == READ_CACHE {
-		*reply = *kv.cacheMap[args.ClientId].reply
+		*reply = *kv.cacheMap[args.ClientId].Reply
 	} else {
 		reply.Err = ErrWrongLeader
 	}
@@ -156,7 +157,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	DPrintfToFile(kv.me, "server:%d lock %d \n", kv.me, 3)
 	if cache, ok := kv.cacheMap[args.ClientId]; ok {
-		if cache.seq == args.ClientSeq {
+		if cache.Seq == args.ClientSeq {
 			// Only OK reply for PutAppend can be cached.
 			reply.Err = OK
 			DPrintfToFile(kv.me, "server:%d unlock %d \n", kv.me, 3)
@@ -185,7 +186,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		DPrintfToFile(kv.me, "server:%d unlock %d \n", kv.me, 2)
+		DPrintfToFile(kv.me, "server:%d PA nonleader return \n", kv.me)
 		kv.mu.Unlock()
 		return
 	}
@@ -196,7 +197,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintfToFile(kv.me, "server:%d unlock %d \n", kv.me, 2)
 	kv.mu.Unlock()
 
-	stateOp := <- kv.retMap[index].retCh
+	stateOp := <- ret.retCh
 	if stateOp == EXEC || stateOp == READ_CACHE{
 		reply.Err = OK
 	} else {
@@ -234,6 +235,29 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) Snapshot(index, term int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvMap)
+	e.Encode(kv.cacheMap)
+	snapshot := w.Bytes()
+	kv.rf.Snapshot(index, term, snapshot)
+}
+
+func (kv *KVServer) ReadSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.kvMap) != nil || d.Decode(&kv.cacheMap) != nil {
+	  DPrintfToFile(kv.me, "%d read snapshot error\n", kv.me)
+	}
+	for _, v := range kv.retMap {
+		v.retCh <- WRONG_LEADER
+	}
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -267,11 +291,21 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvMap = make(map[string]string)
 	kv.cacheMap = make(map[int64]*CacheEntry)
 
+	// init from snapshot.
+	kv.ReadSnapshot(persister.ReadSnapshot())
+
 	go func () {
 		for applyMsg := range kv.applyCh {
 			DPrintfToFile(kv.me, "server:%d attempt lock %d \n", kv.me, 0)
 			kv.mu.Lock()
 			DPrintfToFile(kv.me, "server:%d lock %d \n", kv.me, 0)
+			if !applyMsg.CommandValid {
+				// this is a snapshot, reload state machine.
+				kv.ReadSnapshot(applyMsg.Snapshot)
+				DPrintfToFile(kv.me, "server:%d unlock %d \n", kv.me, 0)
+				kv.mu.Unlock()
+				continue
+			}
 			index := applyMsg.CommandIndex
 			DPrintfToFile(kv.me, "server: %d received %d from applyCh \n", kv.me, index)
 			op := applyMsg.Command.(Op)
@@ -279,7 +313,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			// First check if this op is a retry.
 			if cache, ok := kv.cacheMap[op.ClientId]; ok {
 				// if this is a retry, then early return no matter this is leader or not.
-				if cache.seq == op.ClientSeq {
+				if cache.Seq == op.ClientSeq {
 					if ret, ok := kv.retMap[index]; ok {
 						ret.retCh <- READ_CACHE
 						DPrintfToFile(kv.me, "server:%d unlock %d \n", kv.me, 0)
@@ -290,7 +324,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			}
 
 			cache := CacheEntry{}
-			cache.seq = op.ClientSeq
+			cache.Seq = op.ClientSeq
 			if op.Type == PUT {
 				kv.kvMap[op.Key] = op.Value
 			} else if op.Type == APPEND {
@@ -308,13 +342,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				} else {
 					reply.Err = ErrNoKey
 				}
-				cache.reply = &reply
+				cache.Reply = &reply
 				// Write reply to retMap.
 				if ret, ok := kv.retMap[index]; ok {
 					ret.reply = &reply
 				}
 			}
 			kv.cacheMap[op.ClientId] = &cache
+
+			// maybe take a snapshot if perisister is full. Do we need to take snapshot at other places as well?
+			if maxraftstate >=0 && persister.RaftStateSize() >= maxraftstate {
+				kv.Snapshot(index, applyMsg.Term)
+			}
 
 			// send signal to retMap so handler can return to client.
 			if ret, ok := kv.retMap[index]; ok {

@@ -629,6 +629,7 @@ func TestSnapshotRPC3B(t *testing.T) {
 	Put(cfg, ck, "a", "A")
 	check(cfg, t, ck, "a", "A")
 
+
 	// a bunch of puts into the majority partition.
 	cfg.partition([]int{0, 1}, []int{2})
 	{
@@ -639,6 +640,7 @@ func TestSnapshotRPC3B(t *testing.T) {
 		time.Sleep(electionTimeout)
 		Put(cfg, ck1, "b", "B")
 	}
+
 
 	// check that the majority partition has thrown away
 	// most of its log entries.
@@ -660,6 +662,7 @@ func TestSnapshotRPC3B(t *testing.T) {
 		check(cfg, t, ck1, "49", "49")
 	}
 
+
 	// now everybody
 	cfg.partition([]int{0, 1, 2}, []int{})
 
@@ -667,6 +670,7 @@ func TestSnapshotRPC3B(t *testing.T) {
 	check(cfg, t, ck, "c", "C")
 	check(cfg, t, ck, "e", "E")
 	check(cfg, t, ck, "1", "1")
+
 
 	cfg.end()
 }
